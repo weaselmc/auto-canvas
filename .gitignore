@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+#Data
+SC-401-Labs/**
+!data/.gitkeep
+Pages/**
