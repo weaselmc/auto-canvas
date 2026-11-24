@@ -5,6 +5,7 @@ from pathlib import Path
 import requests
 import subprocess
 import sys
+from  include import ACCESS_TOKEN
 
 try:
 
@@ -37,7 +38,7 @@ print("markdownify ready")
 
 CANVAS_URL = "https://learn.tafe.wa.edu.au"
 COURSE_ID = 2477
-ACCESS_TOKEN = "YOUR_TOKEN"
+#ACCESS_TOKEN = "YOUR_TOKEN"
 
 OUTPUT_DIR = Path("./canvas_export")
 

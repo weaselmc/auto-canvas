@@ -6,6 +6,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from uuid import uuid4
 from xml.etree.ElementTree import Element
+from  include import ACCESS_TOKEN
 
 import markdown
 from markdown.inlinepatterns import InlineProcessor
@@ -18,8 +19,7 @@ import requests
 CANVAS_URL = "https://learn.tafe.wa.edu.au"
 COURSE_ID = 2477
 DEFAULT_ASSIGNMENT_GROUP_WEIGHT = 0
-
-ACCESS_TOKEN = "29127~DrRWk3V6ZDfhEQBaKYAxEcQvHaHhUen3MFEGVrAeRY2efRTkDUweR3v3xYVDG8ZX"
+#ACCESS_TOKEN = "YOUR_TOKEN"
 
 PAGES_DIR = Path(
     r"C:\Users\mbutt\OneDrive - TAFE\Documents\Courses\ICT50220 Dip IT (Adv Networking) - AC20\Enterprise Communication\Material\Pages"
