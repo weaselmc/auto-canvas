@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 
+import argparse
+import mimetypes
+import os
 import re
 import sys
 from html.parser import HTMLParser
 from pathlib import Path
 from uuid import uuid4
 from xml.etree.ElementTree import Element
-from  include import ACCESS_TOKEN
 
 import markdown
 from markdown.inlinepatterns import InlineProcessor
@@ -14,24 +16,65 @@ import requests
 
 ##############################################################################
 # CONFIGURATION
+#
+# Nothing course-specific is hard-coded here: the course ID, access token,
+# Canvas URL and pages directory are all supplied at runtime via
+# --course-id / --access-token / --canvas-url / --pages-dir (or the
+# CANVAS_COURSE_ID / CANVAS_ACCESS_TOKEN / CANVAS_URL / CANVAS_PAGES_DIR
+# environment variables). include.py is used only as a token fallback.
 ##############################################################################
 
 CANVAS_URL = "https://learn.tafe.wa.edu.au"
-COURSE_ID = 2477
 DEFAULT_ASSIGNMENT_GROUP_WEIGHT = 0
-#ACCESS_TOKEN = "YOUR_TOKEN"
+DEFAULT_PAGES_DIR = Path(__file__).resolve().parent / "Pages"
+DEFAULT_MEDIA_FOLDER = "Course Images"
 
-PAGES_DIR = Path(
-    r"C:\Users\mbutt\OneDrive - TAFE\Documents\Courses\ICT50220 Dip IT (Adv Networking) - AC20\Enterprise Communication\Material\Pages"
-)
+try:
+    from include import ACCESS_TOKEN as FALLBACK_TOKEN
+except Exception:
+    FALLBACK_TOKEN = None
+
+COURSE_ID = None
+PAGES_DIR = DEFAULT_PAGES_DIR
+MEDIA_FOLDER = DEFAULT_MEDIA_FOLDER
+MEDIA_URLS = {}
 
 ##############################################################################
-# API HEADERS
+# API HEADERS (rebuilt from the token in parse_args)
 ##############################################################################
 
 HEADERS = {
-    "Authorization": f"Bearer {ACCESS_TOKEN}"
+    "Authorization": f"Bearer {FALLBACK_TOKEN or ''}"
 }
+
+##############################################################################
+# MEDIA LINKING (media/ child of the pages directory)
+##############################################################################
+
+MEDIA_SRC_RE = re.compile(
+    r'src=["\']media/([^"\']+?)["\']'
+)
+
+
+def link_media(html):
+
+    def replace(match):
+
+        rel = match.group(1).replace("\\", "/").strip()
+        url = MEDIA_URLS.get(rel)
+        if url is None:
+            url = MEDIA_URLS.get(rel.split("/")[-1])
+        if url is None:
+            print(
+                f"    WARNING: no uploaded file for "
+                f"media reference {rel}"
+            )
+            return match.group(0)
+
+        return f'src="{url}"'
+
+    return MEDIA_SRC_RE.sub(replace, html)
+
 
 ##############################################################################
 # MARKDOWN → CANVAS HTML
@@ -76,6 +119,10 @@ def markdown_to_canvas_html(md_content):
         50
     )
     html = parser.convert(md_content)
+
+    html = link_media(
+        html
+    )
 
     return f"""
 <div style="max-width:1200px; margin:auto;">
@@ -348,6 +395,157 @@ def delete_module_item(module_id, item_id):
 
     if r.status_code not in [200, 204]:
         r.raise_for_status()
+
+
+##############################################################################
+# MEDIA UPLOAD (course files API)
+##############################################################################
+
+def list_course_files(course_id):
+
+    url = f"{CANVAS_URL}/api/v1/courses/{course_id}/files"
+    files = []
+
+    while url:
+
+        r = requests.get(
+            url,
+            headers=HEADERS,
+            params={"per_page": 50}
+        )
+        r.raise_for_status()
+        files.extend(r.json())
+        url = r.links.get("next", {}).get("url")
+
+    return files
+
+
+def resolve_file_url(data):
+
+    url = data.get("url") or data.get("download_url")
+    if url and not url.startswith("http"):
+        url = CANVAS_URL + url
+
+    return url
+
+
+def upload_course_file(course_id, local_path, folder_name):
+
+    mime = (
+        mimetypes.guess_type(local_path.name)[0]
+        or "application/octet-stream"
+    )
+
+    url = f"{CANVAS_URL}/api/v1/courses/{course_id}/files"
+
+    with open(local_path, "rb") as f:
+        r = requests.post(
+            url,
+            headers=HEADERS,
+            files={"file": (local_path.name, f, mime)},
+            data={
+                "name": local_path.name,
+                "folder_name": folder_name
+            }
+        )
+
+    r.raise_for_status()
+    data = r.json()
+
+    if data.get("upload_url"):
+        # Instructure/inscloudgate two-step upload: send the bytes to
+        # the presigned URL as a plain multipart "file" part, then
+        # embed via the stable /files/<id>?download=false pattern
+        # (signed URLs in the response expire, so do not use them).
+        with open(local_path, "rb") as f:
+            up = requests.post(
+                data["upload_url"],
+                files={"file": (local_path.name, f, mime)},
+                timeout=300
+            )
+        up.raise_for_status()
+        up_data = up.json()
+        file_id = up_data.get("id")
+        if not file_id:
+            raise RuntimeError(
+                f"Step 2 upload of {local_path.name} "
+                f"did not return a file id"
+            )
+        return (
+            f"{CANVAS_URL}/files/{file_id}?download=false"
+        )
+
+    file_id = data.get("id")
+    if file_id:
+        return (
+            f"{CANVAS_URL}/files/{file_id}?download=false"
+        )
+
+    return resolve_file_url(
+        data
+    )
+
+
+def upload_media(course_id, pages_dir, folder_name):
+
+    global MEDIA_URLS
+    MEDIA_URLS = {}
+
+    media_dir = Path(pages_dir) / "media"
+    if not media_dir.is_dir():
+        return []
+
+    local_files = sorted(
+        p for p in media_dir.rglob("*") if p.is_file()
+    )
+    if not local_files:
+        return []
+
+    existing = {
+        (f.get("display_name") or f.get("filename"), f.get("size")): f
+        for f in list_course_files(
+            course_id
+        )
+    }
+
+    uploaded = []
+    for path in local_files:
+
+        rel = path.relative_to(media_dir).as_posix()
+        hit = existing.get((path.name, path.stat().st_size))
+        if hit:
+            if hit.get("id"):
+                file_url = (
+                    f"{CANVAS_URL}/files/"
+                    f"{hit['id']}?download=false"
+                )
+            else:
+                file_url = resolve_file_url(
+                    hit
+                )
+            print(
+                f"    Reusing existing course file {path.name}"
+            )
+        else:
+            file_url = upload_course_file(
+                course_id,
+                path,
+                folder_name
+            )
+            print(
+                f"    Uploaded {path.name}"
+            )
+
+        if not file_url:
+            raise RuntimeError(
+                f"Canvas did not return a URL for {path.name}"
+            )
+
+        MEDIA_URLS[rel] = file_url
+        MEDIA_URLS[path.name] = file_url
+        uploaded.append(rel)
+
+    return uploaded
 
 
 ##############################################################################
@@ -1601,12 +1799,12 @@ def parse_quiz_content(content, title):
 # FILE SELECTION
 ##############################################################################
 
-def get_markdown_files():
+def get_markdown_files(single_file=None):
 
-    if len(sys.argv) > 1:
+    if single_file:
 
         file = Path(
-            sys.argv[1]
+            single_file
         )
 
         if not file.is_absolute():
@@ -1617,8 +1815,11 @@ def get_markdown_files():
         return [file]
 
     return sorted(
-        PAGES_DIR.glob(
-            "session*.md"
+        (
+            p for p in PAGES_DIR.iterdir()
+            if p.is_file()
+            and p.suffix.lower() == ".md"
+            and p.name.lower().startswith("session")
         ),
         key=lambda p: p.name.lower()
     )
@@ -1953,9 +2154,131 @@ def import_file(md_file):
 # MAIN
 ##############################################################################
 
+def parse_args():
+
+    global CANVAS_URL, COURSE_ID, PAGES_DIR, MEDIA_FOLDER, HEADERS
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Import Canvas course modules from Markdown session files. "
+            "The pages directory must contain session*.md files and "
+            "(optionally) a media/ child directory with the images "
+            "referenced by those pages."
+        )
+    )
+    parser.add_argument(
+        "--course-id",
+        type=int,
+        default=None,
+        help="Canvas course ID (or set CANVAS_COURSE_ID)"
+    )
+    parser.add_argument(
+        "--access-token",
+        default=None,
+        help=(
+            "Canvas API token (or set CANVAS_ACCESS_TOKEN; "
+            "falls back to include.py)"
+        )
+    )
+    parser.add_argument(
+        "--pages-dir",
+        default=None,
+        help=(
+            "Directory containing the session*.md files and the "
+            "media/ child directory (default: <repo>/Pages)"
+        )
+    )
+    parser.add_argument(
+        "--canvas-url",
+        default=None,
+        help="Canvas base URL (default: https://learn.tafe.wa.edu.au)"
+    )
+    parser.add_argument(
+        "--media-folder",
+        default=DEFAULT_MEDIA_FOLDER,
+        help=(
+            f"Course files folder for uploaded media "
+            f"(default: {DEFAULT_MEDIA_FOLDER})"
+        )
+    )
+    parser.add_argument(
+        "file",
+        nargs="?",
+        default=None,
+        help="Import a single Markdown file instead of all session*.md"
+    )
+
+    args = parser.parse_args()
+
+    CANVAS_URL = (
+        args.canvas_url
+        or os.environ.get("CANVAS_URL")
+        or "https://learn.tafe.wa.edu.au"
+    )
+
+    access_token = (
+        args.access_token
+        or os.environ.get("CANVAS_ACCESS_TOKEN")
+        or FALLBACK_TOKEN
+    )
+    if not access_token:
+        parser.error(
+            "no access token provided: use --access-token or "
+            "CANVAS_ACCESS_TOKEN (or provide include.py)"
+        )
+
+    course_id = args.course_id
+    if course_id is None and os.environ.get("CANVAS_COURSE_ID"):
+        course_id = int(os.environ["CANVAS_COURSE_ID"])
+    if not course_id:
+        parser.error(
+            "no course ID provided: use --course-id or CANVAS_COURSE_ID"
+        )
+
+    pages_dir = Path(
+        args.pages_dir
+        or os.environ.get("CANVAS_PAGES_DIR")
+        or DEFAULT_PAGES_DIR
+    )
+    if not pages_dir.is_dir():
+        parser.error(
+            f"pages directory not found: {pages_dir}"
+        )
+
+    COURSE_ID = int(course_id)
+    PAGES_DIR = pages_dir
+    MEDIA_FOLDER = args.media_folder
+    HEADERS = {
+        "Authorization": f"Bearer {access_token}"
+    }
+
+    return args
+
+
 def main():
 
-    files = get_markdown_files()
+    args = parse_args()
+
+    uploaded = upload_media(
+        COURSE_ID,
+        PAGES_DIR,
+        MEDIA_FOLDER
+    )
+    if uploaded:
+        print(
+            f"\nMedia: {len(uploaded)} file(s) from "
+            f"{PAGES_DIR / 'media'} "
+            f"-> course files folder '{MEDIA_FOLDER}'"
+        )
+    else:
+        print(
+            "\nMedia: no media/ directory in "
+            f"{PAGES_DIR}; page image references will be left as-is"
+        )
+
+    files = get_markdown_files(
+        args.file
+    )
 
     for file in files:
 
